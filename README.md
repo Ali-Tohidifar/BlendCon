@@ -1,4 +1,5 @@
 # BlendCon
+## Official implementation of Make it till you fake it: Construction-centric computational framework for simultaneous image synthetization and multimodal labeling
 
 BlendCon is a fully automated framework designed for synthesizing and labeling construction imagery data. It facilitates the simulation of a construction site by orchestrating 3D mobile objects against a 3D background and produces multimodal labels for target entities. This tool is especially valuable in training object detection models in construction environments.
 
