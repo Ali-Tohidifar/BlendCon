@@ -8,6 +8,7 @@ import os
 import zoneinfo
 import bpy
 import bpy_extras
+import json
 from pathlib import Path
 from mathutils import Vector
 from datetime import datetime, timezone
@@ -21,12 +22,13 @@ timestamp_edt = timestamp_utc.astimezone(edt_timezone)
 timestamp = timestamp_edt.strftime('%y-%m-%d-%H-%M')
 
 
+Code_dir = Path(os.getcwd())
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('DataGenerator')
 
 # Ensure log messages are saved to a file
-log_file = f'/workspace/logs/{timestamp}_data_generation.log'
+log_file = f'{Code_dir}/logs/{timestamp}_data_generation.log'
 if not os.path.exists(os.path.dirname(log_file)):
     os.makedirs(os.path.dirname(log_file))
 fh = logging.FileHandler(log_file)
@@ -38,7 +40,6 @@ logger.info('Loading configuration file.')
 
 logger.info('Starting data generation process.')
 
-Code_dir = Path(os.getcwd())
 
 "Read config and user inputs"
 # Read config yamlfile
@@ -48,6 +49,7 @@ with open(Code_dir / "config.yaml", "r") as yamlfile:
 
 # Setup directories
 Dataset_dir = Code_dir / 'Dataset'
+Dataset_dir.mkdir(parents=True, exist_ok=True)
 Avatar_dir = Code_dir / 'Avatars'
 Scene_dir = Code_dir / 'Scenes'
 # report_path = Code_dir / 'Report.txt'
@@ -95,6 +97,30 @@ for device in devices:
 Functions
 """
 
+"Helper Functions"
+
+def get_active_view_layer():
+    """Return the active view layer, falling back to the first available one."""
+    view_layer = getattr(bpy.context, "view_layer", None)
+    if view_layer is not None:
+        return view_layer
+    # fallback: return the first view layer in the scene
+    return bpy.context.scene.view_layers[0]
+
+
+def to_pixel(value: float) -> int:
+    """Convert a float pixel coordinate to the nearest integer pixel."""
+    return int(round(value))
+
+
+def camera_coord_to_pixel(cam_coord, render_size):
+    """Convert normalized camera coordinates to pixel space while keeping depth."""
+    return [
+        to_pixel(cam_coord.x * render_size[0]),
+        to_pixel(render_size[1] * (1 - cam_coord.y)),
+        cam_coord.z
+    ]
+
 "New Camera Function"
 
 def new_camera(focal_len=20):
@@ -128,13 +154,15 @@ def occlusion_detector(target_arm, origin):
         bonePos = target_arm.matrix_world @ bone.head
         bpy.ops.mesh.primitive_cube_add(
             size=0.02, enter_editmode=False, align='WORLD', location=bonePos, scale=(1, 1, 1))
-        added_cubes.append(bpy.context.active_object)
+        added_cubes.append((bpy.context.active_object, bone.name))
+        
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
 
     # iterate through target cubes and identify occlusion
     occlusion = 0
-    for target in added_cubes:
+    bone_occlusion_dict = {}
+    for target, bone_name in added_cubes:
         # calculate target hit distance
         target_in_target_space = target.matrix_world.inverted() @ target.location
         origin_in_target_space = target.matrix_world.inverted() @ origin.location
@@ -158,16 +186,19 @@ def occlusion_detector(target_arm, origin):
 
             if ray_cast_obj[0] and target_distance.length > obj_distance.length:
                 occlusion += 1
+                bone_occlusion_dict[bone_name] = True
+            else:
+                bone_occlusion_dict[bone_name] = False
 
     # calculate occlusion percentage
     precentage = occlusion/len(added_cubes)
 
     # remove added cubes
-    for cube in added_cubes:
+    for cube, _ in added_cubes:
         cube.select_set(True)
     bpy.ops.object.delete()
 
-    return precentage
+    return precentage, bone_occlusion_dict
 
 
 "Joint Tracker Function"
@@ -248,9 +279,10 @@ def joint_tracker(lighting, workers_name_list, path=Dataset_dir):
             info_on_each_frame_for_each_worker = {}
 
             # calculate occlusion
-            occlusion_percentage = occlusion_detector(
+            occlusion_percentage, bone_occlusion_dict = occlusion_detector(
                 worker, bpy.context.scene.camera)
             info_on_each_frame_for_each_worker['occlusion'] = occlusion_percentage
+            info_on_each_frame_for_each_worker['bone_occlusion'] = bone_occlusion_dict
 
             # add bone names to info dict
             info_on_each_frame_for_each_worker['bone_name'] = bones_list_dict[str(
@@ -324,9 +356,9 @@ def joint_tracker(lighting, workers_name_list, path=Dataset_dir):
                     bounding_box_3D_min_z = 1*float('inf')
 
                 else:
-                    pixel_coordinate_x = coordinate_2d.x * render_size[0]
-                    pixel_coordinate_y = render_size[1] - \
-                        (coordinate_2d.y * render_size[1])
+                    pixel_coordinate_x = to_pixel(coordinate_2d.x * render_size[0])
+                    pixel_coordinate_y = to_pixel(
+                        render_size[1] - (coordinate_2d.y * render_size[1]))
 
                     # Saving bone locations of each workers
                     worker_bone_pixel_location_dict[str(bone.name)] = [
@@ -334,13 +366,13 @@ def joint_tracker(lighting, workers_name_list, path=Dataset_dir):
 
                     ### Fix this part ###
                     # Selecting the max and min bounding box coordinates
-                    if pixel_coordinate_x < bounding_box_min_x:
+                    if pixel_coordinate_x < bounding_box_min_x and bone_occlusion_dict[str(bone.name)] == False:
                         bounding_box_min_x = pixel_coordinate_x
-                    if pixel_coordinate_x > bounding_box_max_x:
+                    if pixel_coordinate_x > bounding_box_max_x and bone_occlusion_dict[str(bone.name)] == False:
                         bounding_box_max_x = pixel_coordinate_x
-                    if pixel_coordinate_y < bounding_box_min_y:
+                    if pixel_coordinate_y < bounding_box_min_y and bone_occlusion_dict[str(bone.name)] == False:
                         bounding_box_min_y = pixel_coordinate_y
-                    if pixel_coordinate_y > bounding_box_max_y:
+                    if pixel_coordinate_y > bounding_box_max_y and bone_occlusion_dict[str(bone.name)] == False:
                         bounding_box_max_y = pixel_coordinate_y
 
                     # Selecting the max and min 3D bounding box coordinates
@@ -371,7 +403,8 @@ def joint_tracker(lighting, workers_name_list, path=Dataset_dir):
             else:
                 # add bone info and bb info to info dict
                 info_on_each_frame_for_each_worker['BB2D'] = [
-                    [bounding_box_min_x, bounding_box_min_y], [bounding_box_max_x, bounding_box_max_y]]
+                    [int(bounding_box_min_x), int(bounding_box_min_y)],
+                    [int(bounding_box_max_x), int(bounding_box_max_y)]]
                 info_on_each_frame_for_each_worker['BB3D_global_coordinate'] = [[bounding_box_3D_min_x, bounding_box_3D_min_y, bounding_box_3D_min_z], [
                     bounding_box_3D_max_x, bounding_box_3D_max_y, bounding_box_3D_max_z]]
                 info_on_each_frame_for_each_worker['bone_location_3d'] = worker_bone_3d_location_dict
@@ -413,22 +446,14 @@ def joint_tracker(lighting, workers_name_list, path=Dataset_dir):
                 p8_3DBB_camera = bpy_extras.object_utils.world_to_camera_view(
                     bpy.context.scene, bpy.context.scene.camera, p8_3DBB_glob)
 
-                p1_3DBB_pixel = [p1_3DBB_camera.x * render_size[0],
-                                 render_size[1] * (1 - p1_3DBB_camera.y), p1_3DBB_camera.z]
-                p2_3DBB_pixel = [p2_3DBB_camera.x * render_size[0],
-                                 render_size[1] * (1 - p2_3DBB_camera.y), p2_3DBB_camera.z]
-                p3_3DBB_pixel = [p3_3DBB_camera.x * render_size[0],
-                                 render_size[1] * (1 - p3_3DBB_camera.y), p3_3DBB_camera.z]
-                p4_3DBB_pixel = [p4_3DBB_camera.x * render_size[0],
-                                 render_size[1] * (1 - p4_3DBB_camera.y), p4_3DBB_camera.z]
-                p5_3DBB_pixel = [p5_3DBB_camera.x * render_size[0],
-                                 render_size[1] * (1 - p5_3DBB_camera.y), p5_3DBB_camera.z]
-                p6_3DBB_pixel = [p6_3DBB_camera.x * render_size[0],
-                                 render_size[1] * (1 - p6_3DBB_camera.y), p6_3DBB_camera.z]
-                p7_3DBB_pixel = [p7_3DBB_camera.x * render_size[0],
-                                 render_size[1] * (1 - p7_3DBB_camera.y), p7_3DBB_camera.z]
-                p8_3DBB_pixel = [p8_3DBB_camera.x * render_size[0],
-                                 render_size[1] * (1 - p8_3DBB_camera.y), p8_3DBB_camera.z]
+                p1_3DBB_pixel = camera_coord_to_pixel(p1_3DBB_camera, render_size)
+                p2_3DBB_pixel = camera_coord_to_pixel(p2_3DBB_camera, render_size)
+                p3_3DBB_pixel = camera_coord_to_pixel(p3_3DBB_camera, render_size)
+                p4_3DBB_pixel = camera_coord_to_pixel(p4_3DBB_camera, render_size)
+                p5_3DBB_pixel = camera_coord_to_pixel(p5_3DBB_camera, render_size)
+                p6_3DBB_pixel = camera_coord_to_pixel(p6_3DBB_camera, render_size)
+                p7_3DBB_pixel = camera_coord_to_pixel(p7_3DBB_camera, render_size)
+                p8_3DBB_pixel = camera_coord_to_pixel(p8_3DBB_camera, render_size)
 
                 # save 3D bounding box's edges as tuples of corners
                 info_on_each_frame_for_each_worker['BB3D'] = [(p1_3DBB_pixel, p2_3DBB_pixel), (p2_3DBB_pixel, p3_3DBB_pixel), (p3_3DBB_pixel, p4_3DBB_pixel), (p4_3DBB_pixel, p5_3DBB_pixel), (p4_3DBB_pixel, p1_3DBB_pixel), (
@@ -447,13 +472,15 @@ def joint_tracker(lighting, workers_name_list, path=Dataset_dir):
     # Saving dictionaries
     with open('Joint_Tracker.pickle', 'wb') as handle:
         pickle.dump(Information_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    with open('Joint_Tracker.json', 'w') as handle:
+        json.dump(Information_dict, handle, indent=4)
 
 
 
 "Depth Map Function"
 def Depth_Map_Genrator(output_path):
     bpy.context.scene.use_nodes = True
-    bpy.context.scene.view_layers["View Layer"].use_pass_mist = True
+    get_active_view_layer().use_pass_mist = True
     bpy.context.scene.world.mist_settings.start = 0
     bpy.context.scene.world.mist_settings.depth = 25
 
@@ -484,7 +511,7 @@ def Depth_Map_Genrator(output_path):
 "Segmantation function"
 def Setup_Segmentation(output_path, occlusion_thrsh=0.98):
 
-    bpy.context.scene.view_layers["View Layer"].use_pass_object_index = True
+    get_active_view_layer().use_pass_object_index = True
 
     workers = [worker for worker in bpy.data.objects if 'Armature' in worker.name]
     workers = sorted(workers, key=lambda x: x.name)     # sort the workers based on their name to make masks consistant
@@ -620,7 +647,7 @@ def rendering_random_camera(lighting, itr, camera, target_rig, scene_name, worke
     camera.location = obj.matrix_world @ rand_mesh_face
 
     # check occlusion and replace camera
-    occlusion_percentage = occlusion_detector(target_rig, camera)
+    occlusion_percentage, _ = occlusion_detector(target_rig, camera)
 
     iter = 0
     while occlusion_percentage >= 1 and iter < 30:
@@ -630,7 +657,7 @@ def rendering_random_camera(lighting, itr, camera, target_rig, scene_name, worke
         # snap camera to random location
         camera.location = obj.matrix_world @ rand_mesh_face
 
-        occlusion_percentage = occlusion_detector(target_rig, camera)
+        occlusion_percentage, _ = occlusion_detector(target_rig, camera)
         iter += 1
 
     # set the start and end of the render to the target rig's animation start and finish
